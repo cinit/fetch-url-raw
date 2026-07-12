@@ -32,6 +32,9 @@ from fetch_url_raw.errors import (
 
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_RESPONSE_BYTES = 1_048_576
+# Prefetch ceiling so large text responses can be fully decoded before
+# truncating the LLM-facing payload to max_response_bytes.
+TEXT_PREFETCH_BYTES = 16 * 1024 * 1024
 DEFAULT_MAX_REDIRECTS = 20
 ALLOWED_SCHEMES = frozenset({"http", "https"})
 # Methods commonly used by HTTP clients; TRACE is allowed per design but
@@ -228,14 +231,67 @@ def _normalize_request_body(
     )
 
 
-def _decode_body(raw: bytes, content_type: str | None, charset: str | None) -> dict[str, Any]:
+def _prefetch_limit(output_limit: int) -> int:
+    """How many body bytes to buffer before decoding/truncating for the LLM.
+
+    Always read at least TEXT_PREFETCH_BYTES (unless output_limit is 0) so a
+    multi-megabyte text/JS response can be decoded as text, then truncated to
+    max_response_bytes in the tool result.
+    """
+    if output_limit <= 0:
+        return 0
+    return max(output_limit, TEXT_PREFETCH_BYTES)
+
+
+def _truncate_bytes(raw: bytes, limit: int) -> tuple[bytes, bool]:
+    if limit <= 0:
+        return b"", bool(raw)
+    if len(raw) <= limit:
+        return raw, False
+    return raw[:limit], True
+
+
+def _truncate_text(text: str, limit: int, encoding: str) -> tuple[str, int, bool]:
+    """Truncate decoded text so the UTF-8/encoding byte length is <= limit."""
+    if limit <= 0:
+        return "", 0, bool(text)
+    try:
+        encoded = text.encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        encoding = "utf-8"
+        encoded = text.encode("utf-8")
+    if len(encoded) <= limit:
+        return text, len(encoded), False
+    # Cut on a valid character boundary for the encoding.
+    cut = encoded[:limit]
+    try:
+        out = cut.decode(encoding)
+    except UnicodeDecodeError:
+        out = cut.decode(encoding, errors="ignore")
+    return out, len(out.encode(encoding)), True
+
+
+def _decode_body(
+    raw: bytes,
+    content_type: str | None,
+    charset: str | None,
+    *,
+    allow_partial: bool = False,
+) -> dict[str, Any]:
+    """Decode response bytes.
+
+    When ``allow_partial`` is True (buffer cut at the prefetch limit), tolerate
+    incomplete multi-byte sequences at the end so truncated text can still be
+    returned to the LLM.
+    """
     if _is_text_content_type(content_type):
         encoding = charset or "utf-8"
+        errors = "ignore" if allow_partial else "strict"
         try:
-            text = raw.decode(encoding)
-        except (LookupError, UnicodeDecodeError):
+            text = raw.decode(encoding, errors=errors)
+        except LookupError:
             try:
-                text = raw.decode("utf-8")
+                text = raw.decode("utf-8", errors=errors)
                 encoding = "utf-8"
             except UnicodeDecodeError:
                 return {
@@ -243,6 +299,20 @@ def _decode_body(raw: bytes, content_type: str | None, charset: str | None) -> d
                     "body_base64": base64.b64encode(raw).decode("ascii"),
                     "encoding": None,
                 }
+        except UnicodeDecodeError:
+            try:
+                text = raw.decode("utf-8", errors=errors)
+                encoding = "utf-8"
+            except UnicodeDecodeError:
+                if allow_partial:
+                    text = raw.decode("utf-8", errors="ignore")
+                    encoding = "utf-8"
+                else:
+                    return {
+                        "body": None,
+                        "body_base64": base64.b64encode(raw).decode("ascii"),
+                        "encoding": None,
+                    }
         return {
             "body": text,
             "body_base64": None,
@@ -301,20 +371,20 @@ def _content_length_from_headers(headers: httpx.Headers) -> int | None:
 def _resolve_content_length(
     *,
     header_length: int | None,
-    received_bytes: int,
-    truncated: bool,
+    full_bytes_seen: int,
+    body_complete: bool,
 ) -> int | None:
-    """Actual response body size for agents, especially when truncated.
+    """Actual response body size for agents, especially when output is truncated.
 
     Preference:
     1. Content-Length header when valid (authoritative full size)
-    2. received_bytes when the body was fully read (not truncated)
-    3. None when truncated and total size is unknown
+    2. full_bytes_seen when the body was fully read from the wire
+    3. None when the stream was cut at the prefetch buffer and total size is unknown
     """
     if header_length is not None:
         return header_length
-    if not truncated:
-        return received_bytes
+    if body_complete:
+        return full_bytes_seen
     return None
 
 
@@ -882,28 +952,33 @@ async def fetch_url_raw(
             except Exception as exc:  # noqa: BLE001
                 raise _map_exception(exc) from exc
 
+            # Buffer up to max(limit, 16 MiB) so large text can be decoded, then
+            # truncate the tool-facing payload to max_response_bytes.
+            prefetch = _prefetch_limit(limit)
             try:
                 chunks: list[bytes] = []
-                received = 0
-                truncated = False
+                buffered = 0
+                hit_prefetch_limit = False
                 async for chunk in response.aiter_bytes():
                     if not chunk:
                         continue
-                    if limit == 0:
-                        truncated = True
+                    if prefetch == 0:
+                        # max_response_bytes == 0: do not buffer body; mark truncated
+                        # if any bytes exist.
+                        hit_prefetch_limit = True
                         break
-                    remaining = limit - received
+                    remaining = prefetch - buffered
                     if remaining <= 0:
-                        truncated = True
+                        hit_prefetch_limit = True
                         break
                     if len(chunk) > remaining:
                         chunks.append(chunk[:remaining])
-                        received += remaining
-                        truncated = True
+                        buffered += remaining
+                        hit_prefetch_limit = True
                         break
                     chunks.append(chunk)
-                    received += len(chunk)
-                raw = b"".join(chunks)
+                    buffered += len(chunk)
+                raw_full = b"".join(chunks)
             except Exception as exc:  # noqa: BLE001
                 await response.aclose()
                 raise _map_exception(exc) from exc
@@ -912,14 +987,55 @@ async def fetch_url_raw(
 
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             content_type, charset = _parse_content_type(response.headers.get("content-type"))
-            decoded = _decode_body(raw, content_type, charset)
-            body_json = _parse_body_json(raw, decoded["body"])
+            body_complete = not hit_prefetch_limit
             header_length = _content_length_from_headers(response.headers)
             content_length = _resolve_content_length(
                 header_length=header_length,
-                received_bytes=received,
-                truncated=truncated,
+                full_bytes_seen=buffered,
+                body_complete=body_complete,
             )
+
+            # Decode from the buffered payload (up to 16 MiB). Partial decode is
+            # allowed when we hit the prefetch ceiling mid-stream.
+            decoded_full = _decode_body(
+                raw_full,
+                content_type,
+                charset,
+                allow_partial=hit_prefetch_limit,
+            )
+            encoding = decoded_full["encoding"]
+            body_text: str | None = decoded_full["body"]
+            body_b64: str | None = decoded_full["body_base64"]
+            truncated = False
+            received = buffered
+
+            if body_text is not None:
+                body_text, received, out_trunc = _truncate_text(
+                    body_text, limit, encoding or "utf-8"
+                )
+                truncated = out_trunc or hit_prefetch_limit
+                body_b64 = None
+                raw_for_json = body_text.encode(encoding or "utf-8") if not truncated else b""
+            else:
+                raw_out, out_trunc = _truncate_bytes(raw_full, limit)
+                truncated = out_trunc or hit_prefetch_limit
+                received = len(raw_out)
+                if raw_out:
+                    body_b64 = base64.b64encode(raw_out).decode("ascii")
+                else:
+                    body_b64 = None
+                body_text = None
+                raw_for_json = raw_out if not truncated else b""
+
+            # Only expose body_json when the full body is returned (not truncated).
+            body_json = (
+                _parse_body_json(raw_for_json, body_text) if not truncated else None
+            )
+            decoded = {
+                "body": body_text,
+                "body_base64": body_b64,
+                "encoding": encoding if body_text is not None else None,
+            }
 
             final_url = str(response.url)
             redirected = final_url.rstrip("/") != str(parsed_url).rstrip("/") or len(response.history) > 0

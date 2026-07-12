@@ -259,10 +259,12 @@ Example
 1 MiB
 ```
 
-Once exceeded:
+Returned payload is truncated to this size for the LLM. Internally the client may buffer up to 16 MiB first so large text responses can be decoded, then truncates the tool output. When the full size is known (Content-Length or body finished within the prefetch buffer), it is reported in `content_length`.
 
-* stop downloading
+Once the returned size is exceeded:
+
 * mark truncated
+* keep only the first N bytes/text for `body` / `body_base64`
 
 ---
 

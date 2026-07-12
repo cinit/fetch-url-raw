@@ -163,7 +163,7 @@ Blocked attempts return:
 | State | Stateless — safe to restart anytime; no DB or disk cache |
 | Network | Outbound HTTP/HTTPS only; needs reachability to targets you fetch |
 | Security | Tool can hit arbitrary URLs — run only for trusted clients; consider host firewall / network policy |
-| Resources | Response bodies are capped (`max_response_bytes`, default 1 MiB) to limit memory |
+| Resources | Returned body is capped (`max_response_bytes`, default 1 MiB); up to 16 MiB may be buffered to decode large text |
 | Proxies | System proxy env is ignored (`trust_env=False`) for predictable behavior |
 | Logs | Server logs go to stderr; keep stdin/stdout for MCP framing in stdio mode |
 | HTTP listen | Not started unless `--transport streamable-http` or `--transport sse` is set |
@@ -189,7 +189,7 @@ Once the MCP server is connected, call the `fetch_url_raw` tool from the client.
 | `body` | string \| object \| array \| number \| bool | — | Request body: raw string as-is, or JSON value (object/array/number/bool) which is serialized and gets `Content-Type: application/json` when unset |
 | `timeout` | number | `30` | Timeout in seconds |
 | `follow_redirect` | bool | `true` | Follow redirects |
-| `max_response_bytes` | int | `1048576` | Stop reading after this many body bytes |
+| `max_response_bytes` | int | `1048576` | Max body bytes returned to the LLM. Internally buffers up to 16 MiB so large text can still be decoded, then truncates the returned `body`/`body_base64` |
 | `dns_override` | object | — | Hostname → IP map (like `curl --resolve`) |
 | `verify_tls` | bool | `true` | Verify TLS certificates |
 
@@ -278,9 +278,10 @@ Raw string body (no auto Content-Type):
 - Text-like content types (`text/*`, `application/json`, etc.) fill `body` (string still kept).
 - `body_json` is set **only** when the body is valid JSON (object/array/etc.); otherwise `null`.
 - Other non-text types set `body` to `null` and put Base64 data in `body_base64`.
-- If the body hits `max_response_bytes`, `truncated` is `true` and only the first N bytes are returned.
-- `received_bytes` is how many body bytes were actually returned (after truncation).
-- `content_length` is the full response body size when known: from the `Content-Length` header if present, otherwise equal to `received_bytes` when not truncated, otherwise `null` when truncated without a usable header. Use this so agents know the real size when truncated.
+- Internally the client may buffer up to **16 MiB** so large text (e.g. JS bundles) can be decoded as text even when `max_response_bytes` is smaller. The tool result is then truncated to `max_response_bytes`.
+- If the returned body is truncated, `truncated` is `true` and only the first N bytes (or text whose UTF-8 size is N) are returned.
+- `received_bytes` is how many body bytes were actually returned to the LLM (after truncation).
+- `content_length` is the full response body size when known: from the `Content-Length` header if present, otherwise the full size if the body fit in the 16 MiB prefetch buffer, otherwise `null` if the stream was cut at the prefetch ceiling without a header. Use this so agents know the real size (e.g. 1 MiB JS) while reading only the first 64 KiB of text.
 
 ### Error response
 

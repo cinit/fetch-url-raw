@@ -11,6 +11,8 @@ import pytest
 
 from fetch_url_raw.fetch import (
     DEFAULT_MAX_RESPONSE_BYTES,
+    TEXT_PREFETCH_BYTES,
+    _prefetch_limit,
     _content_length_from_headers,
     _decode_body,
     _is_text_content_type,
@@ -87,9 +89,9 @@ def test_parse_body_json_only_when_valid():
 
 
 def test_resolve_content_length():
-    assert _resolve_content_length(header_length=500, received_bytes=100, truncated=True) == 500
-    assert _resolve_content_length(header_length=None, received_bytes=42, truncated=False) == 42
-    assert _resolve_content_length(header_length=None, received_bytes=100, truncated=True) is None
+    assert _resolve_content_length(header_length=500, full_bytes_seen=100, body_complete=False) == 500
+    assert _resolve_content_length(header_length=None, full_bytes_seen=42, body_complete=True) == 42
+    assert _resolve_content_length(header_length=None, full_bytes_seen=100, body_complete=False) is None
 
 
 def test_content_length_from_headers():
@@ -223,8 +225,8 @@ async def test_fetch_truncation_without_content_length(monkeypatch):
     assert result["success"] is True
     assert result["truncated"] is True
     assert result["received_bytes"] == 50
-    # No valid Content-Length => null so agent knows full size is unknown
-    assert result["content_length"] is None
+    # Body fits in the 16 MiB prefetch buffer, so full size is known even without Content-Length.
+    assert result["content_length"] == 5_000
 
 
 @pytest.mark.asyncio
@@ -494,3 +496,85 @@ async def test_fetch_post_json_object_body(mock_transport):
     # auto Content-Type should be present on the outbound request
     hdrs = {k.lower(): v for k, v in payload["headers"].items()}
     assert "application/json" in hdrs.get("content-type", "")
+
+
+
+def test_prefetch_limit_constant():
+    assert TEXT_PREFETCH_BYTES == 16 * 1024 * 1024
+    assert _prefetch_limit(64 * 1024) == TEXT_PREFETCH_BYTES
+    assert _prefetch_limit(20 * 1024 * 1024) == 20 * 1024 * 1024
+    assert _prefetch_limit(0) == 0
+
+
+@pytest.mark.asyncio
+async def test_large_text_prefetch_and_truncate(monkeypatch):
+    """JS/text larger than max_response_bytes but under 16 MiB should decode as text.
+
+    LLM sees first max_response_bytes of text plus real content_length.
+    """
+    full = ("// bundle\n" + ("x" * 1000) + "\n").encode("utf-8") * 20  # ~20KB-ish
+    # Make ~200KB of javascript-like text
+    full = (b"var a=1;" + b"x" * 1024) * 200  # ~200KB+
+    assert len(full) > 64 * 1024
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=full,
+            headers={
+                "Content-Type": "text/javascript; charset=utf-8",
+                "Content-Length": str(len(full)),
+            },
+        )
+
+    transport = httpx.MockTransport(handler)
+    original_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = transport
+        kwargs.pop("verify", None)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+    result = await fetch_url_raw(
+        url="https://example.com/app.js",
+        max_response_bytes=64 * 1024,
+    )
+    assert result["success"] is True
+    assert result["truncated"] is True
+    assert result["content_type"] == "text/javascript"
+    assert result["body"] is not None
+    assert result["body_base64"] is None
+    assert result["received_bytes"] == 64 * 1024
+    assert result["content_length"] == len(full)
+    assert result["body"].startswith("var a=1;")
+    # Returned text encodes to the truncated size
+    assert len(result["body"].encode("utf-8")) == 64 * 1024
+
+
+@pytest.mark.asyncio
+async def test_text_without_content_length_full_size_from_prefetch(monkeypatch):
+    payload = ("hello world\n" * 1000).encode("utf-8")  # ~12KB
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=payload,
+            headers={"Content-Type": "text/plain; charset=utf-8", "Content-Length": ""},
+        )
+
+    transport = httpx.MockTransport(handler)
+    original_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = transport
+        kwargs.pop("verify", None)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+    result = await fetch_url_raw(url="https://example.com/note.txt", max_response_bytes=100)
+    assert result["success"] is True
+    assert result["truncated"] is True
+    assert result["body"] is not None
+    assert result["content_length"] == len(payload)
+    assert result["received_bytes"] == 100
