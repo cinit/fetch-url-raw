@@ -289,12 +289,18 @@ Failures return a structured object instead of raising:
 | `INVALID_URL` | Missing/unsupported scheme or host |
 | `INVALID_PARAMETER` | Bad method, headers, timeout, etc. |
 | `DNS_ERROR` | Hostname could not be resolved |
-| `TIMEOUT` | Connect/read/write timed out |
-| `TLS_ERROR` | Certificate or TLS failure |
-| `CONNECT_ERROR` | TCP/connect failure |
+| `TIMEOUT` | Connect/read/write/pool timed out (message says which phase) |
+| `TLS_ERROR` | Certificate or TLS failure (message distinguishes expired, self-signed/untrusted, hostname/SAN mismatch, incomplete chain, outdated/unsupported protocol, malformed TLS) |
+| `CONNECT_ERROR` | TCP/connect failure (message distinguishes refused, reset/RST, network/host unreachable, broken pipe, etc.) |
 | `DESTINATION_BLOCKED` | Resolved destination IP denied by private-network policy |
 | `PROTOCOL_ERROR` | HTTP protocol / too many redirects |
 | `HTTP_ERROR` / `ERROR` | Other HTTP or unexpected failure |
+
+Example `message` values:
+
+- `TIMEOUT`: `Connection timed out while establishing TCP/TLS`, `Timed out while reading the response`
+- `CONNECT_ERROR`: `Connection refused (no service listening or port closed)`, `Connection reset by peer (TCP RST during connect or request)`, `Network is unreachable (no route to destination network)`, `No route to host (destination host unreachable)`
+- `TLS_ERROR`: `TLS certificate has expired`, `TLS certificate is self-signed and not trusted (...)`, `TLS certificate hostname mismatch: ... (wrong CNAME/SAN)`, `TLS certificate chain incomplete or untrusted: unable to get local issuer certificate (...)`, `TLS protocol version mismatch or unsupported/outdated TLS (...)`, `TLS handshake failed: malformed or unexpected TLS data (...)`
 
 ## Features
 

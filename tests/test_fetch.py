@@ -299,3 +299,140 @@ async def test_fetch_invalid_method_structured():
 @pytest.mark.asyncio
 async def test_default_max_response_bytes_constant():
     assert DEFAULT_MAX_RESPONSE_BYTES == 1_048_576
+
+
+# --- Structured exception mapping -------------------------------------------------
+
+from fetch_url_raw.fetch import _map_exception
+
+
+def _wrap_connect(message: str, cause: BaseException | None = None) -> httpx.ConnectError:
+    """Build an httpx.ConnectError chain similar to production (httpx -> httpcore -> cause)."""
+    import httpcore
+
+    core: BaseException = httpcore.ConnectError(message)
+    if cause is not None:
+        # Real stacks often have an intermediate OSError("All connection attempts failed").
+        if not isinstance(cause, (httpcore.ConnectError, httpx.ConnectError)):
+            outer = OSError("All connection attempts failed")
+            outer.__cause__ = cause
+            core.__cause__ = outer
+        else:
+            core.__cause__ = cause
+    exc = httpx.ConnectError(message)
+    exc.__cause__ = core
+    return exc
+
+
+def test_map_timeout_kinds():
+    assert _map_exception(httpx.ConnectTimeout("")).error_type == "TIMEOUT"
+    assert "Connection timed out" in _map_exception(httpx.ConnectTimeout("")).message
+    assert "reading" in _map_exception(httpx.ReadTimeout("")).message.lower()
+    assert "sending" in _map_exception(httpx.WriteTimeout("")).message.lower()
+
+
+def test_map_dns_error_message():
+    err = _map_exception(httpx.ConnectError("Name or service not known"))
+    assert err.error_type == "DNS_ERROR"
+    assert "DNS resolution failed" in err.message
+
+
+def test_map_connect_refused_reset_unreachable():
+    cases = [
+        (ConnectionRefusedError(111, "Connect call failed"), "Connection refused", "CONNECT_ERROR"),
+        (ConnectionResetError(104, "Connection reset by peer"), "Connection reset by peer", "CONNECT_ERROR"),
+        (OSError(101, "Network is unreachable"), "Network is unreachable", "CONNECT_ERROR"),
+        (OSError(113, "No route to host"), "No route to host", "CONNECT_ERROR"),
+        (OSError(110, "Connection timed out"), "timed out", "TIMEOUT"),
+    ]
+    for cause, needle, etype in cases:
+        err = _map_exception(_wrap_connect("All connection attempts failed", cause))
+        assert err.error_type == etype, (cause, err.error_type, err.message)
+        assert needle.lower() in err.message.lower(), err.message
+
+
+def test_map_tls_certificate_kinds():
+    import ssl
+
+    def tls_verify(message: str, verify_message: str, code: int = 1) -> httpx.ConnectError:
+        cause = ssl.SSLCertVerificationError(1, message)
+        # Attributes present on CPython OpenSSL errors in real failures.
+        try:
+            cause.verify_message = verify_message  # type: ignore[attr-defined]
+            cause.verify_code = code  # type: ignore[attr-defined]
+            cause.reason = "CERTIFICATE_VERIFY_FAILED"  # type: ignore[attr-defined]
+            cause.library = "SSL"  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        # Even if attrs cannot be set, message string alone should classify.
+        return _wrap_connect(message, cause)
+
+    cases = [
+        (
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: certificate has expired (_ssl.c:1081)",
+            "certificate has expired",
+            "expired",
+        ),
+        (
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1081)",
+            "self-signed certificate",
+            "self-signed",
+        ),
+        (
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1081)",
+            "self-signed certificate in certificate chain",
+            "untrusted",
+        ),
+        (
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'wrong.host.badssl.com'. (_ssl.c:1081)",
+            "Hostname mismatch, certificate is not valid for 'wrong.host.badssl.com'.",
+            "hostname mismatch",
+        ),
+        (
+            "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:1081)",
+            "unable to get local issuer certificate",
+            "incomplete or untrusted",
+        ),
+    ]
+    for message, verify_message, needle in cases:
+        err = _map_exception(tls_verify(message, verify_message))
+        assert err.error_type == "TLS_ERROR", err.message
+        assert needle.lower() in err.message.lower(), (needle, err.message)
+
+
+def test_map_tls_protocol_and_malformed():
+    import ssl
+    import httpcore
+
+    def tls_ssl(message: str, reason: str) -> httpx.ConnectError:
+        cause = ssl.SSLError(1, message)
+        try:
+            cause.reason = reason  # type: ignore[attr-defined]
+            cause.library = "SSL"  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        core = httpcore.ConnectError(message)
+        core.__cause__ = cause
+        exc = httpx.ConnectError(message)
+        exc.__cause__ = core
+        return exc
+
+    expired_proto = _map_exception(
+        tls_ssl("[SSL: UNSUPPORTED_PROTOCOL] unsupported protocol (_ssl.c:1081)", "UNSUPPORTED_PROTOCOL")
+    )
+    assert expired_proto.error_type == "TLS_ERROR"
+    assert "protocol" in expired_proto.message.lower() or "outdated" in expired_proto.message.lower()
+
+    malformed = _map_exception(
+        tls_ssl("[SSL: RECORD_LAYER_FAILURE] record layer failure (_ssl.c:1081)", "RECORD_LAYER_FAILURE")
+    )
+    assert malformed.error_type == "TLS_ERROR"
+    assert "malformed" in malformed.message.lower() or "unexpected" in malformed.message.lower()
+
+
+def test_map_destination_blocked_prefix():
+    err = _map_exception(
+        httpx.ConnectError("DESTINATION_BLOCKED: destination IP 10.0.0.1 is private/local (policy)")
+    )
+    assert err.error_type == "DESTINATION_BLOCKED"
+    assert "10.0.0.1" in err.message

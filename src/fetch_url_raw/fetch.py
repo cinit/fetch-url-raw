@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import errno
 import json
 import re
+import socket
+import ssl
 import time
 from email.message import Message
 from typing import Any
@@ -267,69 +271,491 @@ def _resolve_content_length(
     return None
 
 
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """Walk __cause__/__context__ without cycles (httpx nests OSError/SSLError)."""
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _combined_exception_text(exc: BaseException) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for item in _exception_chain(exc):
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        parts.append(text)
+        for attr in ("verify_message", "strerror", "reason"):
+            extra = getattr(item, attr, None)
+            if extra is None:
+                continue
+            extra_s = str(extra).strip()
+            if extra_s and extra_s not in seen:
+                seen.add(extra_s)
+                parts.append(extra_s)
+    return " | ".join(parts)
+
+
+def _first_errno(exc: BaseException) -> int | None:
+    for item in _exception_chain(exc):
+        err = getattr(item, "errno", None)
+        if isinstance(err, int):
+            return err
+        if isinstance(item, OSError) and isinstance(item.args, tuple) and item.args:
+            # Some OSError-like wrappers put errno first.
+            if isinstance(item.args[0], int):
+                return item.args[0]
+    # httpcore may strip __cause__; recover errno embedded in messages.
+    text = _combined_exception_text(exc)
+    match = re.search(r"\[Errno\s+(\d+)\]", text)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
+
+
+def _strip_ssl_c_suffix(text: str) -> str:
+    return re.sub(r"\s*\(_ssl\.c:\d+\)\s*$", "", text).strip()
+
+
+def _extract_cert_verify_detail(text: str) -> str | None:
+    marker = "certificate verify failed:"
+    lower = text.lower()
+    if marker not in lower:
+        return None
+    idx = lower.index(marker) + len(marker)
+    detail = _strip_ssl_c_suffix(text[idx:]).strip(" .")
+    return detail or None
+
+
+def _ssl_verify_message(exc: BaseException) -> str | None:
+    for item in _exception_chain(exc):
+        vm = getattr(item, "verify_message", None)
+        if vm:
+            return str(vm).strip()
+        if isinstance(item, ssl.SSLCertVerificationError):
+            detail = _extract_cert_verify_detail(str(item))
+            if detail:
+                return detail
+            cleaned = _strip_ssl_c_suffix(str(item)).strip()
+            return cleaned or None
+    # Message-only wrappers (tests / some transports) without SSLCertVerificationError.
+    return _extract_cert_verify_detail(_combined_exception_text(exc))
+
+
+def _ssl_reason(exc: BaseException) -> str | None:
+    for item in _exception_chain(exc):
+        if isinstance(item, ssl.SSLError):
+            reason = getattr(item, "reason", None)
+            if reason:
+                return str(reason)
+    return None
+
+
+def _classify_timeout(exc: BaseException) -> TimeoutError_:
+    if isinstance(exc, httpx.ConnectTimeout):
+        return TimeoutError_("Connection timed out while establishing TCP/TLS")
+    if isinstance(exc, httpx.ReadTimeout):
+        return TimeoutError_("Timed out while reading the response")
+    if isinstance(exc, httpx.WriteTimeout):
+        return TimeoutError_("Timed out while sending the request")
+    if isinstance(exc, httpx.PoolTimeout):
+        return TimeoutError_("Timed out waiting for a connection from the pool")
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+        return TimeoutError_("Operation timed out")
+
+    text = _combined_exception_text(exc).lower()
+    err = _first_errno(exc)
+    if err == errno.ETIMEDOUT or "connection timed out" in text or "connect call failed" in text and "timed out" in text:
+        return TimeoutError_("Connection timed out while establishing TCP/TLS")
+    if "read timed out" in text or "timeout reading" in text:
+        return TimeoutError_("Timed out while reading the response")
+    if "write timed out" in text:
+        return TimeoutError_("Timed out while sending the request")
+    if isinstance(exc, httpx.TimeoutException):
+        detail = str(exc).strip()
+        return TimeoutError_(detail or "Operation timed out")
+    return TimeoutError_("Operation timed out")
+
+
+def _classify_dns(exc: BaseException, text: str) -> DnsError | None:
+    lower = text.lower()
+    dns_markers = (
+        "name or service not known",
+        "nodename nor servname",
+        "temporary failure in name resolution",
+        "getaddrinfo failed",
+        "name resolution",
+        "dns resolution",
+        "no address associated with hostname",
+        "nodename nor servname provided",
+        "gaierror",
+    )
+    if any(m in lower for m in dns_markers):
+        # Prefer a short stable message; keep hostname detail when present.
+        raw = str(exc).strip()
+        if "Name or service not known:" in raw:
+            host = raw.split("Name or service not known:", 1)[-1].strip()
+            if host:
+                return DnsError(f"DNS resolution failed for {host}")
+        if "Name or service not known" in raw:
+            return DnsError("DNS resolution failed: name or service not known")
+        return DnsError(f"DNS resolution failed: {raw or 'unknown host'}")
+    for item in _exception_chain(exc):
+        if isinstance(item, socket.gaierror):
+            return DnsError(f"DNS resolution failed: {item}")
+    return None
+
+
+def _classify_tls(exc: BaseException, text: str) -> TlsError | None:
+    lower = text.lower()
+    reason = (_ssl_reason(exc) or "").upper()
+    verify_msg = (_ssl_verify_message(exc) or "").strip()
+    verify_lower = verify_msg.lower()
+
+    is_tls = (
+        isinstance(exc, ssl.SSLError)
+        or any(isinstance(item, ssl.SSLError) for item in _exception_chain(exc))
+        or "certificate" in lower
+        or "ssl" in lower
+        or "tls" in lower
+        or reason
+    )
+    if not is_tls:
+        return None
+
+    # Certificate verification failures (trust / hostname / validity).
+    if (
+        isinstance(exc, ssl.SSLCertVerificationError)
+        or any(isinstance(item, ssl.SSLCertVerificationError) for item in _exception_chain(exc))
+        or "certificate_verify_failed" in lower
+        or "certificate verify failed" in lower
+        or reason == "CERTIFICATE_VERIFY_FAILED"
+    ):
+        # Hostname / CNAME / SAN mismatch (cert may otherwise be valid).
+        if (
+            "hostname mismatch" in verify_lower
+            or "hostname mismatch" in lower
+            or "not valid for" in verify_lower
+            or "not valid for" in lower
+            or "doesn't match" in lower
+            or "does not match" in lower
+            or "ip address mismatch" in verify_lower
+            or "ip address mismatch" in lower
+        ):
+            detail = (verify_msg or "certificate hostname/IP does not match the requested host").rstrip(".")
+            return TlsError(
+                f"TLS certificate hostname mismatch: {detail}. "
+                "The certificate may be valid but was issued for a different name (wrong CNAME/SAN)."
+            )
+
+        if "has expired" in verify_lower or "has expired" in lower or "certificate expired" in lower:
+            return TlsError(
+                "TLS certificate has expired"
+                + (f" ({verify_msg})" if verify_msg and "expired" not in verify_lower else "")
+            )
+
+        if "not yet valid" in verify_lower or "not yet valid" in lower:
+            return TlsError("TLS certificate is not yet valid")
+
+        if (
+            "self-signed certificate in certificate chain" in verify_lower
+            or "self-signed certificate in certificate chain" in lower
+        ):
+            return TlsError(
+                "TLS certificate chain is untrusted: self-signed certificate in certificate chain "
+                "(untrusted/custom CA; use verify_tls=false only if you trust this host)"
+            )
+
+        if "self-signed certificate" in verify_lower or "self-signed certificate" in lower:
+            return TlsError(
+                "TLS certificate is self-signed and not trusted "
+                "(use verify_tls=false only if you trust this host)"
+            )
+
+        if (
+            "unable to get local issuer certificate" in verify_lower
+            or "unable to get local issuer certificate" in lower
+            or "unable to get issuer certificate" in verify_lower
+            or "unable to get issuer certificate" in lower
+        ):
+            return TlsError(
+                "TLS certificate chain incomplete or untrusted: unable to get local issuer certificate "
+                "(missing intermediate or untrusted CA)"
+            )
+
+        if "unknown ca" in verify_lower or "unable to verify" in lower:
+            return TlsError(
+                "TLS certificate is untrusted (unknown CA or verification failed"
+                + (f": {verify_msg}" if verify_msg else "")
+                + ")"
+            )
+
+        if verify_msg:
+            return TlsError(f"TLS certificate verification failed: {verify_msg}")
+        return TlsError("TLS certificate verification failed")
+
+    # Protocol / version / malformed TLS.
+    if reason in {
+        "UNSUPPORTED_PROTOCOL",
+        "TLSV1_ALERT_PROTOCOL_VERSION",
+        "WRONG_VERSION_NUMBER",
+        "VERSION_TOO_LOW",
+        "VERSION_TOO_HIGH",
+    } or any(
+        m in lower
+        for m in (
+            "unsupported protocol",
+            "wrong version number",
+            "tlsv1 alert protocol version",
+            "protocol version",
+            "version too low",
+            "version too high",
+        )
+    ):
+        return TlsError(
+            "TLS protocol version mismatch or unsupported/outdated TLS "
+            "(peer may only offer obsolete TLS, or non-TLS data was received on an HTTPS connection)"
+        )
+
+    if reason in {
+        "RECORD_LAYER_FAILURE",
+        "UNEXPECTED_EOF_WHILE_READING",
+        "WRONG_SSL_VERSION",
+        "BAD_RECORD_MAC",
+        "DECODE_ERROR",
+        "UNEXPECTED_MESSAGE",
+    } or any(
+        m in lower
+        for m in (
+            "record layer failure",
+            "unexpected eof",
+            "eof occurred in violation of protocol",
+            "wrong ssl version",
+            "bad record mac",
+            "packet length too long",
+            "httpsconnectionpool",
+        )
+    ):
+        return TlsError(
+            "TLS handshake failed: malformed or unexpected TLS data "
+            "(often HTTP on an HTTPS port, a middlebox, or a broken peer handshake)"
+        )
+
+    if reason in {"SSLV3_ALERT_HANDSHAKE_FAILURE", "HANDSHAKE_FAILURE", "NO_SHARED_CIPHER"} or any(
+        m in lower
+        for m in (
+            "handshake failure",
+            "no shared cipher",
+            "sslv3 alert handshake failure",
+        )
+    ):
+        return TlsError(
+            "TLS handshake failure (no shared cipher/protocol or peer rejected the handshake)"
+        )
+
+    if reason == "CERTIFICATE_EXPIRED" or "alert certificate expired" in lower:
+        return TlsError("TLS certificate has expired (alert from peer)")
+
+    # Generic TLS/SSL residual.
+    detail = verify_msg or str(exc).strip() or reason or "TLS error"
+    detail = _strip_ssl_c_suffix(detail)
+    return TlsError(f"TLS error: {detail}")
+
+
+def _classify_connect(exc: BaseException, text: str) -> FetchError:
+    lower = text.lower()
+    err = _first_errno(exc)
+
+    if "destination_blocked" in lower or "DESTINATION_BLOCKED" in text:
+        clean = text.split("DESTINATION_BLOCKED:", 1)[-1].strip() if "DESTINATION_BLOCKED:" in text else text
+        # Prefer the first chain message that mentions destination IP.
+        for item in _exception_chain(exc):
+            s = str(item)
+            if "DESTINATION_BLOCKED:" in s:
+                clean = s.split("DESTINATION_BLOCKED:", 1)[-1].strip()
+                break
+            if "destination" in s.lower() and "blocked" in s.lower():
+                clean = s
+                break
+        return DestinationBlockedError(clean or "Destination IP blocked by network policy")
+
+    dns = _classify_dns(exc, text)
+    if dns is not None:
+        return dns
+
+    tls = _classify_tls(exc, text)
+    if tls is not None:
+        return tls
+
+    # OS-level connect failures (also from text: httpcore may strip __cause__).
+    if (
+        err == errno.ECONNREFUSED
+        or isinstance(exc, ConnectionRefusedError)
+        or any(isinstance(i, ConnectionRefusedError) for i in _exception_chain(exc))
+        or "connection refused" in lower
+        or "connectionrefusederror" in lower
+    ):
+        return ConnectError_("Connection refused (no service listening or port closed)")
+
+    if (
+        err == errno.ECONNRESET
+        or isinstance(exc, ConnectionResetError)
+        or any(isinstance(i, ConnectionResetError) for i in _exception_chain(exc))
+        or "connection reset by peer" in lower
+        or "connection reset" in lower
+        or "connectionreseterror" in lower
+    ):
+        return ConnectError_("Connection reset by peer (TCP RST during connect or request)")
+
+    if (
+        err in {errno.ENETUNREACH, errno.EHOSTUNREACH}
+        or "network is unreachable" in lower
+        or "no route to host" in lower
+        or "host is unreachable" in lower
+    ):
+        if err == errno.ENETUNREACH or "network is unreachable" in lower:
+            return ConnectError_("Network is unreachable (no route to destination network)")
+        return ConnectError_("No route to host (destination host unreachable)")
+
+    if err == errno.ECONNABORTED or "connection abort" in lower:
+        return ConnectError_("Connection aborted")
+
+    if err == errno.EPIPE or "broken pipe" in lower:
+        return ConnectError_("Broken pipe (connection closed while sending)")
+
+    if err == errno.ETIMEDOUT or "connection timed out" in lower:
+        return TimeoutError_("Connection timed out while establishing TCP/TLS")
+
+    # httpcore often collapses multi-address failures.
+    if "all connection attempts failed" in lower:
+        # Look deeper for a more specific nested cause (when still present).
+        for item in _exception_chain(exc)[1:]:
+            nested = _classify_connect(item, _combined_exception_text(item))
+            if nested.error_type in {
+                "CONNECT_ERROR",
+                "TIMEOUT",
+                "DNS_ERROR",
+                "TLS_ERROR",
+                "DESTINATION_BLOCKED",
+            } and not nested.message.lower().startswith("all connection attempts failed"):
+                return nested
+        return ConnectError_("All connection attempts failed (refused, unreachable, or timed out)")
+
+    if isinstance(exc, httpx.ProxyError) or "proxy" in lower:
+        detail = str(exc).strip() or "proxy error"
+        return ConnectError_(f"Proxy error: {detail}")
+
+    detail = str(exc).strip() or "connection failed"
+    if detail.lower() == "all connection attempts failed":
+        return ConnectError_("All connection attempts failed (refused, unreachable, or timed out)")
+    return ConnectError_(f"Connection failed: {detail}")
+
+
 def _map_exception(exc: BaseException) -> FetchError:
     if isinstance(exc, FetchError):
         return exc
 
-    # httpx wraps many failures; inspect both type and nested cause.
-    if isinstance(exc, httpx.TimeoutException):
-        return TimeoutError_(str(exc) or "Operation timed out")
-    if isinstance(exc, httpx.ConnectTimeout):
-        return TimeoutError_(str(exc) or "Connection timed out")
-    if isinstance(exc, httpx.ReadTimeout):
-        return TimeoutError_(str(exc) or "Read timed out")
-    if isinstance(exc, httpx.WriteTimeout):
-        return TimeoutError_(str(exc) or "Write timed out")
-    if isinstance(exc, httpx.PoolTimeout):
-        return TimeoutError_(str(exc) or "Pool timed out")
-
-    if isinstance(exc, httpx.ProxyError):
-        return ConnectError_(str(exc) or "Proxy error")
-
-    msg = str(exc) or exc.__class__.__name__
-    lower = msg.lower()
-
-    if isinstance(exc, (httpx.ConnectError, httpcore.ConnectError)):
-        if "destination_blocked" in lower:
-            # Strip optional prefix for a cleaner client-facing message.
-            clean = msg.split("DESTINATION_BLOCKED:", 1)[-1].strip() if "DESTINATION_BLOCKED:" in msg else msg
-            return DestinationBlockedError(clean or "Destination IP blocked by network policy")
-        if "name or service not known" in lower or "nodename nor servname" in lower:
-            return DnsError(msg)
-        if "temporary failure in name resolution" in lower or "getaddrinfo failed" in lower:
-            return DnsError(msg)
-        if "certificate" in lower or "ssl" in lower or "tls" in lower:
-            return TlsError(msg)
-        return ConnectError_(msg)
-
-    if isinstance(exc, (httpx.ConnectError,)):
-        return ConnectError_(msg)
-
-    # TLS-related
-    if isinstance(exc, httpx.HTTPError) and (
-        "certificate" in lower or "ssl" in lower or "tls" in lower
+    # Timeouts first (httpx subclasses TimeoutException).
+    if isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+            TimeoutError,
+        ),
     ):
-        return TlsError(msg)
+        return _classify_timeout(exc)
 
-    # Inspect cause chain for more specific errors
-    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
-    if cause is not None and cause is not exc:
-        mapped = _map_exception(cause)
-        if not isinstance(mapped, FetchError) or mapped.error_type != "ERROR":
-            # Prefer more specific mapped errors from causes
+    text = _combined_exception_text(exc)
+
+    # Prefer structured TLS exceptions even when wrapped.
+    tls = _classify_tls(exc, text)
+    if tls is not None and (
+        isinstance(exc, ssl.SSLError)
+        or any(isinstance(item, ssl.SSLError) for item in _exception_chain(exc))
+        or "certificate" in text.lower()
+        or "ssl" in text.lower()
+        or "tls" in text.lower()
+    ):
+        # Only accept TLS classification when evidence is strong enough;
+        # _classify_tls already requires TLS markers.
+        if any(
+            isinstance(item, ssl.SSLError) for item in _exception_chain(exc)
+        ) or any(
+            m in text.lower()
+            for m in (
+                "certificate",
+                "ssl",
+                "tls",
+                "handshake",
+            )
+        ):
+            return tls
+
+    if isinstance(exc, (httpx.ConnectError, httpcore.ConnectError, httpx.ProxyError, OSError)):
+        return _classify_connect(exc, text)
+
+    # Protocol errors.
+    if isinstance(
+        exc,
+        (
+            httpx.RemoteProtocolError,
+            httpx.LocalProtocolError,
+            httpcore.RemoteProtocolError,
+            httpcore.LocalProtocolError,
+        ),
+    ):
+        detail = str(exc).strip() or "HTTP protocol error"
+        return ProtocolError_(detail)
+
+    if isinstance(exc, httpx.TooManyRedirects):
+        detail = str(exc).strip() or "Too many redirects"
+        return ProtocolError_(detail)
+
+    # Inspect cause chain for more specific transport errors.
+    for cause in _exception_chain(exc)[1:]:
+        if isinstance(cause, FetchError):
+            return cause
+        if isinstance(
+            cause,
+            (
+                httpx.TimeoutException,
+                TimeoutError,
+                httpx.ConnectError,
+                httpcore.ConnectError,
+                ssl.SSLError,
+                OSError,
+                socket.gaierror,
+            ),
+        ):
+            mapped = _map_exception(cause)
             if mapped.error_type != "ERROR":
                 return mapped
 
-    if isinstance(exc, (httpx.RemoteProtocolError, httpx.LocalProtocolError, httpcore.RemoteProtocolError, httpcore.LocalProtocolError)):
-        return ProtocolError_(msg)
-
-    if isinstance(exc, httpx.TooManyRedirects):
-        return ProtocolError_(msg)
+    # Residual TLS-ish HTTP errors (message-based).
+    lower = text.lower()
+    if isinstance(exc, httpx.HTTPError) and (
+        "certificate" in lower or "ssl" in lower or "tls" in lower
+    ):
+        return _classify_tls(exc, text) or TlsError(str(exc) or "TLS error")
 
     if isinstance(exc, httpx.HTTPError):
-        return FetchError(msg, error_type="HTTP_ERROR")
+        return FetchError(str(exc).strip() or "HTTP error", error_type="HTTP_ERROR")
 
-    return FetchError(msg, error_type="ERROR")
+    return FetchError(str(exc).strip() or exc.__class__.__name__, error_type="ERROR")
 
 
 def _build_transport(

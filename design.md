@@ -682,10 +682,12 @@ Examples:
   "success": false,
   "error": {
     "type":"TLS_ERROR",
-    "message":"Certificate verify failed"
+    "message":"TLS certificate hostname mismatch: Hostname mismatch, certificate is not valid for 'wrong.example'. The certificate may be valid but was issued for a different name (wrong CNAME/SAN)."
   }
 }
 ```
+
+TLS messages distinguish common cases: expired, self-signed/untrusted CA, hostname/SAN mismatch, incomplete chain, outdated/unsupported protocol, and malformed TLS (e.g. HTTP on an HTTPS port).
 
 ---
 
@@ -696,10 +698,12 @@ Examples:
   "success": false,
   "error": {
     "type":"CONNECT_ERROR",
-    "message":"Connection refused"
+    "message":"Connection refused (no service listening or port closed)"
   }
 }
 ```
+
+Connect messages also distinguish TCP reset, network/host unreachable, and similar OS-level failures. Timeouts name the phase (connect vs read vs write).
 
 ---
 

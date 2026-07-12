@@ -14,6 +14,41 @@ from httpcore._backends.anyio import AnyIOBackend
 from fetch_url_raw.network_policy import blocked_reason, is_destination_blocked
 
 
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _format_connect_failure(exc: BaseException) -> str:
+    """Flatten nested connect failures into a message that survives cause stripping.
+
+    httpcore's connection pool re-raises with ``raise exc from None``, so
+    errno/OSError details must live in the exception message itself.
+    """
+    parts: list[str] = []
+    seen: set[str] = set()
+    for item in _exception_chain(exc):
+        text = str(item).strip()
+        if text and text not in seen:
+            seen.add(text)
+            parts.append(text)
+        err = getattr(item, "errno", None)
+        if isinstance(err, int) and isinstance(item, OSError):
+            # Prefer the OSError line which already includes [Errno N] ...
+            label = item.__class__.__name__
+            detail = f"{label}: {item}"
+            if detail not in seen:
+                seen.add(detail)
+                parts.append(detail)
+    return " <- ".join(parts) if parts else exc.__class__.__name__
+
+
 class GuardedNetworkBackend(AnyIOBackend):
     """Async network backend with optional DNS remap and IP destination policy.
 
@@ -111,6 +146,7 @@ class GuardedNetworkBackend(AnyIOBackend):
             )
 
         errors: list[str] = []
+        last_exc: BaseException | None = None
         for ip in allowed_ips:
             try:
                 # Pin connection to the checked IP. SNI/Host stay on original hostname.
@@ -122,16 +158,20 @@ class GuardedNetworkBackend(AnyIOBackend):
                     socket_options=socket_options,
                 )
             except httpcore.ConnectError as exc:
-                errors.append(f"{ip}: {exc}")
+                errors.append(f"{ip}: {_format_connect_failure(exc)}")
+                last_exc = exc
                 continue
             except OSError as exc:
-                errors.append(f"{ip}: {exc}")
+                errors.append(f"{ip}: {_format_connect_failure(exc)}")
+                last_exc = exc
                 continue
 
         detail = "; ".join(errors) if errors else "unknown error"
+        # Embed root-cause text in the message: httpcore may re-raise with
+        # ``raise exc from None`` and drop __cause__.
         raise httpcore.ConnectError(
             f"All connection attempts failed for {host!r} ({detail})"
-        )
+        ) from last_exc
 
 
 # Back-compat alias used by older imports/tests.
