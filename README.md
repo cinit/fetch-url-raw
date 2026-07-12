@@ -34,11 +34,11 @@ source .venv/bin/activate
 pip install -e .
 ```
 
-Confirm the entry point:
+Confirm the entry point (stdio by default; waits on stdin for MCP):
 
 ```bash
 fetch-url-raw
-# process waits on stdin (MCP). Stop with Ctrl+C.
+# Stop with Ctrl+C.
 ```
 
 Or:
@@ -46,6 +46,8 @@ Or:
 ```bash
 python -m fetch_url_raw
 ```
+
+HTTP mode is off by default. To enable it, see section 3 below.
 
 ### 2. Wire into an MCP client
 
@@ -79,7 +81,51 @@ Point the client at the venv interpreter (or the `fetch-url-raw` script) so depe
 
 **Codex / other stdio MCP runners:** use the same `command` + `args` pattern; no extra env is required for basic use.
 
-### 3. Operational notes
+### 3. Optional HTTP server mode (not enabled by default)
+
+Default transport is **stdio**. To expose MCP over HTTP instead, pass `--transport` explicitly and set listen address/port:
+
+```bash
+# Streamable HTTP (recommended HTTP transport)
+fetch-url-raw --transport streamable-http --host 127.0.0.1 --port 8000
+
+# SSE transport
+fetch-url-raw --transport sse --host 127.0.0.1 --port 8000
+
+# Bind all interfaces (trusted networks only)
+fetch-url-raw --transport streamable-http --host 0.0.0.0 --port 9000 --allow-remote
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--transport` | `stdio` | `stdio`, `streamable-http`, or `sse` |
+| `--host` | `127.0.0.1` | Listen IP (HTTP transports only) |
+| `--port` | `8000` | Listen port (HTTP transports only) |
+| `--path` | `/mcp` or `/sse` | Endpoint path (`streamable-http` → `/mcp`, `sse` → `/sse`) |
+| `--stateless-http` | off | FastMCP stateless HTTP mode (`streamable-http` only) |
+| `--allow-remote` | off | Relax Host/Origin DNS-rebinding checks for non-local clients |
+| `--log-level` | `INFO` | Uvicorn/server log level |
+
+Endpoints:
+
+- `streamable-http`: `http://<host>:<port>/mcp` (or custom `--path`)
+- `sse`: `http://<host>:<port>/sse` (messages under the default FastMCP message path)
+
+Example MCP client config against a local HTTP server (client-specific; streamable HTTP):
+
+```json
+{
+  "mcpServers": {
+    "fetch-url-raw": {
+      "url": "http://127.0.0.1:8000/mcp"
+    }
+  }
+}
+```
+
+> HTTP mode is optional. Prefer stdio for desktop/local agent integrations. Only bind `0.0.0.0` or enable `--allow-remote` on trusted networks; the tool can initiate arbitrary outbound HTTP.
+
+### 4. Operational notes
 
 | Topic | Guidance |
 |-------|----------|
@@ -88,9 +134,10 @@ Point the client at the venv interpreter (or the `fetch-url-raw` script) so depe
 | Security | Tool can hit arbitrary URLs — run only for trusted clients; consider host firewall / network policy |
 | Resources | Response bodies are capped (`max_response_bytes`, default 1 MiB) to limit memory |
 | Proxies | System proxy env is ignored (`trust_env=False`) for predictable behavior |
-| Logs | Server logs go to stderr; keep stdin/stdout for MCP framing |
+| Logs | Server logs go to stderr; keep stdin/stdout for MCP framing in stdio mode |
+| HTTP listen | Not started unless `--transport streamable-http` or `--transport sse` is set |
 
-### 4. Optional: install from wheel
+### 5. Optional: install from wheel
 
 ```bash
 pip install dist/fetch_url_raw-0.1.0-py3-none-any.whl
