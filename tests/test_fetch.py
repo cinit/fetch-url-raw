@@ -436,3 +436,61 @@ def test_map_destination_blocked_prefix():
     )
     assert err.error_type == "DESTINATION_BLOCKED"
     assert "10.0.0.1" in err.message
+
+
+from fetch_url_raw.fetch import _normalize_request_body
+
+
+def test_normalize_request_body_string_unchanged():
+    content, headers = _normalize_request_body("plain=text&a=1", {"Content-Type": "application/x-www-form-urlencoded"})
+    assert content == b"plain=text&a=1"
+    assert headers == {"Content-Type": "application/x-www-form-urlencoded"}
+
+
+def test_normalize_request_body_json_object_sets_content_type():
+    content, headers = _normalize_request_body({"hello": "world", "n": 1}, None)
+    assert json.loads(content.decode("utf-8")) == {"hello": "world", "n": 1}
+    assert headers is not None
+    assert headers["Content-Type"] == "application/json; charset=utf-8"
+
+
+def test_normalize_request_body_json_preserves_existing_content_type():
+    content, headers = _normalize_request_body(
+        {"a": True},
+        {"Content-Type": "application/vnd.api+json", "X-Trace": "1"},
+    )
+    assert json.loads(content.decode("utf-8")) == {"a": True}
+    assert headers["Content-Type"] == "application/vnd.api+json"
+    assert headers["X-Trace"] == "1"
+
+
+def test_normalize_request_body_json_array_and_scalars():
+    content, _ = _normalize_request_body([1, "x", False], None)
+    assert json.loads(content.decode("utf-8")) == [1, "x", False]
+    content, _ = _normalize_request_body(42, None)
+    assert content == b"42"
+    content, _ = _normalize_request_body(True, None)
+    assert content == b"true"
+
+
+def test_normalize_request_body_rejects_unsupported():
+    with pytest.raises(InvalidParameterError):
+        _normalize_request_body(object(), None)  # type: ignore[arg-type]
+    with pytest.raises(InvalidParameterError):
+        _normalize_request_body(b"bytes-not-allowed", None)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_fetch_post_json_object_body(mock_transport):
+    result = await fetch_url_raw(
+        url="https://example.com/echo",
+        method="POST",
+        body={"hello": "world", "n": 2},
+    )
+    assert result["success"] is True
+    payload = json.loads(result["body"])
+    assert payload["method"] == "POST"
+    assert json.loads(payload["body"]) == {"hello": "world", "n": 2}
+    # auto Content-Type should be present on the outbound request
+    hdrs = {k.lower(): v for k, v in payload["headers"].items()}
+    assert "application/json" in hdrs.get("content-type", "")

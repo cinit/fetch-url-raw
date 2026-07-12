@@ -181,6 +181,53 @@ def _validate_dns_override(dns_override: dict[str, str] | None) -> dict[str, str
     return out
 
 
+def _header_has(headers: dict[str, str] | None, name: str) -> bool:
+    if not headers:
+        return False
+    target = name.lower()
+    return any(key.lower() == target for key in headers)
+
+
+def _normalize_request_body(
+    body: Any,
+    headers: dict[str, str] | None,
+) -> tuple[bytes | None, dict[str, str] | None]:
+    """Accept raw string bodies or JSON values (LLM-friendly).
+
+    - ``None``: no body
+    - ``str``: sent as UTF-8 bytes unchanged (no Content-Type change)
+    - ``dict`` / ``list`` / ``int`` / ``float`` / ``bool``: JSON-encoded;
+      sets ``Content-Type: application/json; charset=utf-8`` when missing
+    """
+    if body is None:
+        return None, headers
+
+    if isinstance(body, str):
+        return body.encode("utf-8"), headers
+
+    if isinstance(body, (bytes, bytearray, memoryview)):
+        raise InvalidParameterError(
+            "body must be a string (raw payload) or a JSON value (object/array/number/boolean), not bytes"
+        )
+
+    # bool is a subclass of int — check before broader numeric handling is fine
+    # because json.dumps treats bool correctly either way.
+    if isinstance(body, (dict, list, int, float, bool)):
+        try:
+            text = json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise InvalidParameterError(f"body is not JSON-serializable: {exc}") from exc
+        content = text.encode("utf-8")
+        out_headers = dict(headers) if headers is not None else {}
+        if not _header_has(out_headers, "content-type"):
+            out_headers["Content-Type"] = "application/json; charset=utf-8"
+        return content, out_headers if out_headers else headers
+
+    raise InvalidParameterError(
+        "body must be a string (raw payload) or a JSON value (object, array, number, or boolean)"
+    )
+
+
 def _decode_body(raw: bytes, content_type: str | None, charset: str | None) -> dict[str, Any]:
     if _is_text_content_type(content_type):
         encoding = charset or "utf-8"
@@ -783,7 +830,7 @@ async def fetch_url_raw(
     url: str,
     method: str | None = None,
     headers: dict[str, str] | None = None,
-    body: str | None = None,
+    body: Any = None,
     timeout: float | int | None = None,
     follow_redirect: bool = True,
     max_response_bytes: int | None = None,
@@ -804,12 +851,8 @@ async def fetch_url_raw(
             raise InvalidParameterError("follow_redirect must be a boolean")
         if not isinstance(verify_tls, bool):
             raise InvalidParameterError("verify_tls must be a boolean")
-        if body is not None and not isinstance(body, str):
-            raise InvalidParameterError("body must be a string when provided")
 
-        content: bytes | None = None
-        if body is not None:
-            content = body.encode("utf-8")
+        content, req_headers = _normalize_request_body(body, req_headers)
 
         transport = _build_transport(
             verify_tls=verify_tls,

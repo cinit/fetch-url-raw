@@ -186,7 +186,7 @@ Once the MCP server is connected, call the `fetch_url_raw` tool from the client.
 | `url` | string | **required** | Absolute `http` or `https` URL |
 | `method` | string | `GET` | HTTP method (normalized to uppercase) |
 | `headers` | object | — | Request headers (`string` → `string`) |
-| `body` | string | — | Raw body (no automatic JSON encoding) |
+| `body` | string \| object \| array \| number \| bool | — | Request body: raw string as-is, or JSON value (object/array/number/bool) which is serialized and gets `Content-Type: application/json` when unset |
 | `timeout` | number | `30` | Timeout in seconds |
 | `follow_redirect` | bool | `true` | Follow redirects |
 | `max_response_bytes` | int | `1048576` | Stop reading after this many body bytes |
@@ -203,18 +203,30 @@ Once the MCP server is connected, call the `fetch_url_raw` tool from the client.
 }
 ```
 
-**POST JSON**
+**POST JSON** (LLM-friendly: pass a JSON object directly; string body still works)
 
 ```json
 {
   "url": "https://httpbin.org/post",
   "method": "POST",
   "headers": {
-    "Content-Type": "application/json",
     "Authorization": "Bearer token"
   },
-  "body": "{\"hello\":\"world\"}",
+  "body": {"hello": "world"},
   "timeout": 15
+}
+```
+
+Raw string body (no auto Content-Type):
+
+```json
+{
+  "url": "https://httpbin.org/post",
+  "method": "POST",
+  "headers": {
+    "Content-Type": "application/x-www-form-urlencoded"
+  },
+  "body": "hello=world&a=1"
 }
 ```
 
@@ -305,7 +317,7 @@ Example `message` values:
 ## Features
 
 - Methods: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`, `TRACE`
-- Custom headers and raw body
+- Custom headers and body (raw string or JSON value for LLM-friendly POSTs)
 - Timeout, redirect control, response size limit
 - DNS override (SNI and Host header preserved)
 - TLS verification toggle

@@ -29,7 +29,7 @@ mcp = FastMCP(
     name="fetch_url_raw",
     description=(
         "Perform a single raw HTTP request and return status, headers, and body. "
-        "Supports custom method/headers/body, timeouts, redirect following, "
+        "Supports custom method/headers/body (raw string or JSON value), timeouts, redirect following, "
         "max response size, TLS verify toggle, and DNS overrides (like curl --resolve). "
         "Text-like bodies are returned as UTF-8 text; binary bodies are base64-encoded. "
         "On failure returns {success:false, error:{type,message}} instead of throwing."
@@ -40,7 +40,7 @@ async def fetch_url_raw(
     url: str,
     method: str = "GET",
     headers: dict[str, str] | None = None,
-    body: str | None = None,
+    body: Any = None,
     timeout: float = 30.0,
     follow_redirect: bool = True,
     max_response_bytes: int = 1_048_576,
@@ -53,7 +53,9 @@ async def fetch_url_raw(
         url: Absolute http(s) URL to request.
         method: HTTP method (default GET). Normalized to uppercase.
         headers: Optional request headers (string to string).
-        body: Optional raw request body string (no automatic JSON encoding).
+        body: Optional request body. Pass a raw string for form/text/XML/etc, or a
+            JSON object/array/number/boolean (preferred for LLM tool calls) which is
+            serialized as JSON and gets Content-Type application/json when unset.
         timeout: Total request timeout in seconds (default 30).
         follow_redirect: Whether to follow redirects (default true).
         max_response_bytes: Stop reading body after this many bytes (default 1 MiB).

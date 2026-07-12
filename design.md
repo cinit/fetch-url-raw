@@ -190,26 +190,27 @@ Example
 ### body
 
 ```
-string
+string | object | array | number | boolean
 optional
 ```
 
-Raw payload.
+Request payload. Two input styles are accepted so both raw HTTP and LLM tool calls are convenient:
 
-No automatic JSON encoding.
-
-Caller decides everything.
+1. **Raw string** — sent as UTF-8 bytes unchanged. Caller sets `Content-Type` if needed (form, XML, already-serialized JSON string, etc.).
+2. **JSON value** (object / array / number / boolean) — JSON-encoded automatically. If `Content-Type` is missing, it is set to `application/json; charset=utf-8`.
 
 Examples
 
-```
-hello
-```
-
-or
+Raw string:
 
 ```
-{"a":1}
+hello=world&a=1
+```
+
+JSON object (preferred for LLM tool arguments):
+
+```json
+{"a": 1, "name": "x"}
 ```
 
 ---
