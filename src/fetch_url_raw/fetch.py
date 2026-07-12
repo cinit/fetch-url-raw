@@ -12,9 +12,11 @@ from typing import Any
 import httpcore
 import httpx
 
-from fetch_url_raw.dns import DnsOverrideBackend
+from fetch_url_raw import config as runtime_config
+from fetch_url_raw.dns import GuardedNetworkBackend
 from fetch_url_raw.errors import (
     ConnectError_,
+    DestinationBlockedError,
     DnsError,
     FetchError,
     InvalidParameterError,
@@ -288,6 +290,10 @@ def _map_exception(exc: BaseException) -> FetchError:
     lower = msg.lower()
 
     if isinstance(exc, (httpx.ConnectError, httpcore.ConnectError)):
+        if "destination_blocked" in lower:
+            # Strip optional prefix for a cleaner client-facing message.
+            clean = msg.split("DESTINATION_BLOCKED:", 1)[-1].strip() if "DESTINATION_BLOCKED:" in msg else msg
+            return DestinationBlockedError(clean or "Destination IP blocked by network policy")
         if "name or service not known" in lower or "nodename nor servname" in lower:
             return DnsError(msg)
         if "temporary failure in name resolution" in lower or "getaddrinfo failed" in lower:
@@ -330,14 +336,19 @@ def _build_transport(
     *,
     verify_tls: bool,
     dns_override: dict[str, str] | None,
+    allow_private_network: bool | None = None,
 ) -> httpx.AsyncBaseTransport:
     transport = httpx.AsyncHTTPTransport(verify=verify_tls)
-    if dns_override:
-        backend = DnsOverrideBackend(dns_override)
-        # Replace the connection pool's network backend. httpx does not expose
-        # this directly; attaching after construction keeps SNI/Host intact.
-        pool = transport._pool  # type: ignore[attr-defined]
-        pool._network_backend = backend  # type: ignore[attr-defined]
+    allow = (
+        runtime_config.get_allow_private_network()
+        if allow_private_network is None
+        else bool(allow_private_network)
+    )
+    # Always install guarded backend so private destinations are blocked by
+    # resolved IP (and dns_override/literal IPs are checked the same way).
+    backend = GuardedNetworkBackend(dns_override, allow_private_network=allow)
+    pool = transport._pool  # type: ignore[attr-defined]
+    pool._network_backend = backend  # type: ignore[attr-defined]
     return transport
 
 
@@ -352,6 +363,7 @@ async def fetch_url_raw(
     max_response_bytes: int | None = None,
     dns_override: dict[str, str] | None = None,
     verify_tls: bool = True,
+    allow_private_network: bool | None = None,
 ) -> dict[str, Any]:
     """Perform a single stateless HTTP request and return a structured result."""
     try:
@@ -373,7 +385,11 @@ async def fetch_url_raw(
         if body is not None:
             content = body.encode("utf-8")
 
-        transport = _build_transport(verify_tls=verify_tls, dns_override=overrides)
+        transport = _build_transport(
+            verify_tls=verify_tls,
+            dns_override=overrides,
+            allow_private_network=allow_private_network,
+        )
         timeout_cfg = httpx.Timeout(timeout_s)
 
         started = time.perf_counter()

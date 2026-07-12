@@ -104,6 +104,7 @@ fetch-url-raw --transport streamable-http --host 0.0.0.0 --port 9000 --allow-rem
 | `--path` | `/mcp` or `/sse` | Endpoint path (`streamable-http` → `/mcp`, `sse` → `/sse`) |
 | `--stateless-http` | off | FastMCP stateless HTTP mode (`streamable-http` only) |
 | `--allow-remote` | off | Relax Host/Origin DNS-rebinding checks for non-local clients |
+| `--allow-private-network` | off | Allow resolved private/local destination IPs (see below) |
 | `--log-level` | `INFO` | Uvicorn/server log level |
 
 Endpoints:
@@ -124,6 +125,36 @@ Example MCP client config against a local HTTP server (client-specific; streamab
 ```
 
 > HTTP mode is optional. Prefer stdio for desktop/local agent integrations. Only bind `0.0.0.0` or enable `--allow-remote` on trusted networks; the tool can initiate arbitrary outbound HTTP.
+
+### Private / local destination blocking
+
+By default the server **blocks connections by resolved destination IP** (not by DNS name):
+
+- DNS lookup is always allowed
+- After resolve (or `dns_override` / literal IP URL), the TCP destination must not fall in private/local ranges
+- Blocked by default: RFC1918 (`10/8`, `172.16/12`, `192.168/16`), loopback, link-local (`169.254/16`, `fe80::/10`), CGNAT (`100.64/10`), IPv6 ULA (`fc00::/7`)
+- Always blocked: multicast / unspecified special-use ranges
+- IPv4-mapped IPv6 addresses are checked as their IPv4 form
+
+Opt in when you intentionally need LAN/metadata/loopback targets:
+
+```bash
+fetch-url-raw --allow-private-network
+# with HTTP mode:
+fetch-url-raw --transport streamable-http --host 127.0.0.1 --port 8000 --allow-private-network
+```
+
+Blocked attempts return:
+
+```json
+{
+  "success": false,
+  "error": {
+    "type": "DESTINATION_BLOCKED",
+    "message": "destination IP 192.168.1.1 is private/local (...)"
+  }
+}
+```
 
 ### 4. Operational notes
 
@@ -261,6 +292,7 @@ Failures return a structured object instead of raising:
 | `TIMEOUT` | Connect/read/write timed out |
 | `TLS_ERROR` | Certificate or TLS failure |
 | `CONNECT_ERROR` | TCP/connect failure |
+| `DESTINATION_BLOCKED` | Resolved destination IP denied by private-network policy |
 | `PROTOCOL_ERROR` | HTTP protocol / too many redirects |
 | `HTTP_ERROR` / `ERROR` | Other HTTP or unexpected failure |
 
@@ -272,6 +304,7 @@ Failures return a structured object instead of raising:
 - DNS override (SNI and Host header preserved)
 - TLS verification toggle
 - Stateless: no cookies, session cache, or filesystem writes
+- Default block of private/local destination IPs (post-resolve); opt-in with `--allow-private-network`
 - Structured errors suitable for LLM tool loops
 
 ## Development
@@ -289,4 +322,3 @@ See [design.md](design.md) for architecture, DNS override details, body decoding
 ## License
 
 MIT
-stateless

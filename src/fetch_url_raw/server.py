@@ -9,6 +9,7 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from fetch_url_raw import config as runtime_config
 from fetch_url_raw.fetch import fetch_url_raw as do_fetch
 
 TransportName = Literal["stdio", "streamable-http", "sse"]
@@ -123,6 +124,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--allow-private-network",
+        action="store_true",
+        help=(
+            "Allow requests whose resolved destination IP is private/local "
+            "(RFC1918, loopback, link-local, CGNAT, IPv6 ULA fc00::/7, IPv6 "
+            "link-local fe80::/10). Default is block-by-IP after DNS resolve. "
+            "DNS itself is never filtered."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
         default="INFO",
@@ -197,6 +208,13 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
     transport: TransportName = args.transport
+
+    runtime_config.configure(allow_private_network=bool(args.allow_private_network))
+    if args.allow_private_network:
+        print(
+            "warning: --allow-private-network enabled; private/local destination IPs are permitted",
+            file=sys.stderr,
+        )
 
     if transport == "stdio":
         if args.stateless_http:

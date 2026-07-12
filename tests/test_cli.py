@@ -16,6 +16,7 @@ def test_build_parser_defaults():
     assert args.path is None
     assert args.stateless_http is False
     assert args.allow_remote is False
+    assert args.allow_private_network is False
 
 
 def test_build_parser_http_flags():
@@ -32,6 +33,7 @@ def test_build_parser_http_flags():
             "/mcp",
             "--stateless-http",
             "--allow-remote",
+            "--allow-private-network",
             "--log-level",
             "DEBUG",
         ]
@@ -42,6 +44,7 @@ def test_build_parser_http_flags():
     assert args.path == "/mcp"
     assert args.stateless_http is True
     assert args.allow_remote is True
+    assert args.allow_private_network is True
     assert args.log_level == "DEBUG"
 
 
@@ -111,3 +114,21 @@ def test_configure_http_settings_remote_disables_rebinding_protection():
     )
     assert server.mcp.settings.host == "0.0.0.0"
     assert server.mcp.settings.transport_security.enable_dns_rebinding_protection is False
+
+
+def test_main_configures_private_network_flag(monkeypatch):
+    from fetch_url_raw import config as runtime_config
+    from fetch_url_raw import server
+
+    runtime_config.configure(allow_private_network=False)
+    called = {}
+
+    def fake_run(transport="stdio"):
+        called["transport"] = transport
+        called["allow"] = runtime_config.get_allow_private_network()
+
+    monkeypatch.setattr(server.mcp, "run", fake_run)
+    server.main(["--allow-private-network"])
+    assert called["transport"] == "stdio"
+    assert called["allow"] is True
+    runtime_config.configure(allow_private_network=False)

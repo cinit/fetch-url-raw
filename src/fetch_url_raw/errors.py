@@ -56,3 +56,8 @@ class ProtocolError_(FetchError):
 
 class ResponseTooLargeError(FetchError):
     error_type = "RESPONSE_TOO_LARGE"
+
+
+class DestinationBlockedError(FetchError):
+    error_type = "DESTINATION_BLOCKED"
+
