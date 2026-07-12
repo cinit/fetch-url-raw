@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import re
 import time
 from email.message import Message
@@ -201,6 +202,69 @@ def _decode_body(raw: bytes, content_type: str | None, charset: str | None) -> d
     }
 
 
+def _parse_body_json(raw: bytes, body_text: str | None) -> Any | None:
+    """Return parsed JSON if and only if the response body is valid JSON; else None."""
+    candidates: list[str] = []
+    if body_text is not None:
+        candidates.append(body_text)
+    else:
+        # Binary path: still attempt UTF-8 JSON (e.g. mislabeled application/octet-stream).
+        try:
+            candidates.append(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            return None
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        stripped = candidate.strip()
+        if not stripped:
+            continue
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def _content_length_from_headers(headers: httpx.Headers) -> int | None:
+    """Parse Content-Length header when present and valid."""
+    raw_val = headers.get("content-length")
+    if raw_val is None:
+        return None
+    try:
+        # Handle possible comma-joined duplicates by taking the first token.
+        token = str(raw_val).split(",")[0].strip()
+        length = int(token)
+    except (TypeError, ValueError):
+        return None
+    if length < 0:
+        return None
+    return length
+
+
+def _resolve_content_length(
+    *,
+    header_length: int | None,
+    received_bytes: int,
+    truncated: bool,
+) -> int | None:
+    """Actual response body size for agents, especially when truncated.
+
+    Preference:
+    1. Content-Length header when valid (authoritative full size)
+    2. received_bytes when the body was fully read (not truncated)
+    3. None when truncated and total size is unknown
+    """
+    if header_length is not None:
+        return header_length
+    if not truncated:
+        return received_bytes
+    return None
+
+
 def _map_exception(exc: BaseException) -> FetchError:
     if isinstance(exc, FetchError):
         return exc
@@ -364,6 +428,13 @@ async def fetch_url_raw(
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             content_type, charset = _parse_content_type(response.headers.get("content-type"))
             decoded = _decode_body(raw, content_type, charset)
+            body_json = _parse_body_json(raw, decoded["body"])
+            header_length = _content_length_from_headers(response.headers)
+            content_length = _resolve_content_length(
+                header_length=header_length,
+                received_bytes=received,
+                truncated=truncated,
+            )
 
             final_url = str(response.url)
             redirected = final_url.rstrip("/") != str(parsed_url).rstrip("/") or len(response.history) > 0
@@ -380,6 +451,7 @@ async def fetch_url_raw(
                 "http_version": http_version,
                 "headers": _headers_to_dict(response.headers),
                 "body": decoded["body"],
+                "body_json": body_json,
                 "body_base64": decoded["body_base64"],
                 "content_type": content_type,
                 "encoding": decoded["encoding"],
@@ -388,6 +460,7 @@ async def fetch_url_raw(
                 "final_url": final_url,
                 "truncated": truncated,
                 "received_bytes": received,
+                "content_length": content_length,
             }
 
     except FetchError as err:

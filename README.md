@@ -219,6 +219,7 @@ Once the MCP server is connected, call the `fetch_url_raw` tool from the client.
   "http_version": "HTTP/1.1",
   "headers": { "...": "..." },
   "body": "...",
+  "body_json": null,
   "body_base64": null,
   "content_type": "text/html",
   "encoding": "utf-8",
@@ -226,13 +227,17 @@ Once the MCP server is connected, call the `fetch_url_raw` tool from the client.
   "redirected": false,
   "final_url": "https://example.com",
   "truncated": false,
-  "received_bytes": 12345
+  "received_bytes": 12345,
+  "content_length": 12345
 }
 ```
 
-- Text-like content types (`text/*`, `application/json`, etc.) fill `body`.
-- Other types set `body` to `null` and put Base64 data in `body_base64`.
+- Text-like content types (`text/*`, `application/json`, etc.) fill `body` (string still kept).
+- `body_json` is set **only** when the body is valid JSON (object/array/etc.); otherwise `null`.
+- Other non-text types set `body` to `null` and put Base64 data in `body_base64`.
 - If the body hits `max_response_bytes`, `truncated` is `true` and only the first N bytes are returned.
+- `received_bytes` is how many body bytes were actually returned (after truncation).
+- `content_length` is the full response body size when known: from the `Content-Length` header if present, otherwise equal to `received_bytes` when not truncated, otherwise `null` when truncated without a usable header. Use this so agents know the real size when truncated.
 
 ### Error response
 
@@ -284,3 +289,4 @@ See [design.md](design.md) for architecture, DNS override details, body decoding
 ## License
 
 MIT
+stateless

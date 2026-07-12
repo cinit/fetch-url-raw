@@ -11,8 +11,11 @@ import pytest
 
 from fetch_url_raw.fetch import (
     DEFAULT_MAX_RESPONSE_BYTES,
+    _content_length_from_headers,
     _decode_body,
     _is_text_content_type,
+    _parse_body_json,
+    _resolve_content_length,
     _validate_dns_override,
     _validate_method,
     _validate_url,
@@ -70,6 +73,29 @@ def test_decode_body_text_and_binary():
     binary = _decode_body(b"\xff\x00", "application/octet-stream", None)
     assert binary["body"] is None
     assert binary["body_base64"] == base64.b64encode(b"\xff\x00").decode("ascii")
+
+
+def test_parse_body_json_only_when_valid():
+    assert _parse_body_json(b'{"a": 1}', '{"a": 1}') == {"a": 1}
+    assert _parse_body_json(b"[1, 2]", "[1, 2]") == [1, 2]
+    assert _parse_body_json(b"not json", "not json") is None
+    assert _parse_body_json(b"", "") is None
+    # valid JSON without body text (binary path) still parses when UTF-8
+    assert _parse_body_json(b'{"x": true}', None) == {"x": True}
+    # invalid binary is null
+    assert _parse_body_json(b"\xff\x00", None) is None
+
+
+def test_resolve_content_length():
+    assert _resolve_content_length(header_length=500, received_bytes=100, truncated=True) == 500
+    assert _resolve_content_length(header_length=None, received_bytes=42, truncated=False) == 42
+    assert _resolve_content_length(header_length=None, received_bytes=100, truncated=True) is None
+
+
+def test_content_length_from_headers():
+    assert _content_length_from_headers(httpx.Headers({"content-length": "123"})) == 123
+    assert _content_length_from_headers(httpx.Headers({"content-length": "nope"})) is None
+    assert _content_length_from_headers(httpx.Headers({})) is None
 
 
 def _handler(request: httpx.Request) -> httpx.Response:
@@ -133,9 +159,11 @@ async def test_fetch_success_text(mock_transport):
     assert result["success"] is True
     assert result["status"] == 200
     assert result["body"] == "hello world"
+    assert result["body_json"] is None
     assert result["body_base64"] is None
     assert result["truncated"] is False
     assert result["received_bytes"] == len(b"hello world")
+    assert result["content_length"] == len(b"hello world")
     assert result["content_type"] == "text/plain"
     assert "elapsed_ms" in result
 
@@ -146,7 +174,9 @@ async def test_fetch_json_as_text(mock_transport):
     assert result["success"] is True
     assert result["body"] is not None
     assert json.loads(result["body"]) == {"a": 1}
+    assert result["body_json"] == {"a": 1}
     assert result["body_base64"] is None
+    assert result["content_length"] == result["received_bytes"]
 
 
 @pytest.mark.asyncio
@@ -154,6 +184,7 @@ async def test_fetch_binary_base64(mock_transport):
     result = await fetch_url_raw(url="https://example.com/bin")
     assert result["success"] is True
     assert result["body"] is None
+    assert result["body_json"] is None
     assert result["body_base64"] == base64.b64encode(b"\x00\x01\x02\xff").decode("ascii")
 
 
@@ -163,8 +194,37 @@ async def test_fetch_truncation(mock_transport):
     assert result["success"] is True
     assert result["truncated"] is True
     assert result["received_bytes"] == 100
+    # MockTransport sets Content-Length from full content, so agents can see real size.
+    assert result["content_length"] == 10_000
     raw = base64.b64decode(result["body_base64"])
     assert len(raw) == 100
+
+
+async def test_fetch_truncation_without_content_length(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Chunked-style response without Content-Length.
+        return httpx.Response(
+            200,
+            content=b"y" * 5_000,
+            headers={"Content-Type": "application/octet-stream", "Content-Length": ""},
+        )
+
+    # Empty content-length should be treated as missing/invalid.
+    transport = httpx.MockTransport(handler)
+    original_init = httpx.AsyncClient.__init__
+
+    def patched_init(self, *args, **kwargs):
+        kwargs["transport"] = transport
+        kwargs.pop("verify", None)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", patched_init)
+    result = await fetch_url_raw(url="https://example.com/chunked", max_response_bytes=50)
+    assert result["success"] is True
+    assert result["truncated"] is True
+    assert result["received_bytes"] == 50
+    # No valid Content-Length => null so agent knows full size is unknown
+    assert result["content_length"] is None
 
 
 @pytest.mark.asyncio
