@@ -192,6 +192,8 @@ Once the MCP server is connected, call the `fetch_url_raw` tool from the client.
 | `max_response_bytes` | int | `1048576` | Max body bytes returned to the LLM. Internally buffers up to 16 MiB so large text can still be decoded, then truncates the returned `body`/`body_base64` |
 | `dns_override` | object | — | Hostname → IP map (like `curl --resolve`) |
 | `verify_tls` | bool | `true` | Verify TLS certificates |
+| `include_tls` | bool | `false` | Include TLS metadata + peer cert(s) in the result (HTTPS) |
+| `tls_only` | bool | `false` | Handshake only (no HTTP). Requires `include_tls=true` and `https` |
 
 ### Example tool calls
 
@@ -252,6 +254,26 @@ Raw string body (no auto Content-Type):
 }
 ```
 
+**Inspect TLS cert only** (no HTTP request)
+
+```json
+{
+  "url": "https://example.com/",
+  "include_tls": true,
+  "tls_only": true
+}
+```
+
+**Fetch and include TLS info**
+
+```json
+{
+  "url": "https://example.com/",
+  "include_tls": true,
+  "max_response_bytes": 4096
+}
+```
+
 ### Success response
 
 ```json
@@ -281,6 +303,7 @@ Raw string body (no auto Content-Type):
 - Internally the client may buffer up to **16 MiB** so large text (e.g. JS bundles) can be decoded as text even when `max_response_bytes` is smaller. The tool result is then truncated to `max_response_bytes`.
 - If the returned body is truncated, `truncated` is `true` and only the first N bytes (or text whose UTF-8 size is N) are returned.
 - `received_bytes` is how many body bytes were actually returned to the LLM (after truncation).
+- Optional `tls` object (when `include_tls` or on many `TLS_ERROR`s): version, cipher, ALPN, SNI, peer IP, leaf cert PEM/fingerprint/SAN/dates, and chain.
 - `content_length` is the full response body size when known: from the `Content-Length` header if present, otherwise the full size if the body fit in the 16 MiB prefetch buffer, otherwise `null` if the stream was cut at the prefetch ceiling without a header. Use this so agents know the real size (e.g. 1 MiB JS) while reading only the first 64 KiB of text.
 
 ### Error response

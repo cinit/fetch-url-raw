@@ -29,6 +29,7 @@ from fetch_url_raw.errors import (
     TimeoutError_,
     TlsError,
 )
+from fetch_url_raw.tlsinfo import probe_tls
 
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_MAX_RESPONSE_BYTES = 1_048_576
@@ -875,12 +876,75 @@ def _map_exception(exc: BaseException) -> FetchError:
     return FetchError(str(exc).strip() or exc.__class__.__name__, error_type="ERROR")
 
 
+
+async def _maybe_attach_tls(
+    err: FetchError,
+    *,
+    url: str,
+    include_tls: bool,
+    tls_holder: dict[str, Any],
+    verify_tls: bool,
+    dns_override: dict[str, str] | None,
+    allow_private_network: bool | None,
+    timeout: float | int | None,
+) -> FetchError:
+    """Attach TLS metadata to errors when available.
+
+    Preference:
+    1. TLS captured on the real connection (tls_holder)
+    2. For TLS_ERROR on HTTPS, best-effort unverified handshake probe so the
+       LLM still sees the peer certificate that failed verification
+    """
+    if err.tls is not None:
+        return err
+    captured = tls_holder.get("tls")
+    if isinstance(captured, dict):
+        return err.with_tls(captured)
+
+    want_probe = err.error_type == "TLS_ERROR" or include_tls
+    if not want_probe:
+        return err
+    try:
+        parsed = httpx.URL(url.strip())
+    except Exception:  # noqa: BLE001
+        return err
+    if parsed.scheme != "https" or not parsed.host:
+        return err
+    try:
+        allow = (
+            runtime_config.get_allow_private_network()
+            if allow_private_network is None
+            else bool(allow_private_network)
+        )
+        overrides = _validate_dns_override(dns_override) if dns_override else None
+        timeout_s = _validate_timeout(timeout)
+        # Unverified probe: verification already failed or capture missed.
+        tls_info = await probe_tls(
+            host=parsed.host,
+            port=parsed.port or 443,
+            server_hostname=parsed.host,
+            verify_tls=False,
+            dns_override=overrides,
+            allow_private_network=allow,
+            timeout=timeout_s,
+        )
+        tls_info = dict(tls_info)
+        tls_info["verified"] = False
+        if err.error_type == "TLS_ERROR":
+            tls_info["verify_error"] = err.message
+        return err.with_tls(tls_info)
+    except Exception:  # noqa: BLE001 - never fail error reporting because of probe
+        return err
+
+
 def _build_transport(
     *,
     verify_tls: bool,
     dns_override: dict[str, str] | None,
     allow_private_network: bool | None = None,
-) -> httpx.AsyncBaseTransport:
+    capture_tls: bool = False,
+    tls_holder: dict[str, Any] | None = None,
+) -> tuple[httpx.AsyncBaseTransport, GuardedNetworkBackend]:
     transport = httpx.AsyncHTTPTransport(verify=verify_tls)
     allow = (
         runtime_config.get_allow_private_network()
@@ -889,10 +953,15 @@ def _build_transport(
     )
     # Always install guarded backend so private destinations are blocked by
     # resolved IP (and dns_override/literal IPs are checked the same way).
-    backend = GuardedNetworkBackend(dns_override, allow_private_network=allow)
+    backend = GuardedNetworkBackend(
+        dns_override,
+        allow_private_network=allow,
+        capture_tls=capture_tls,
+        tls_holder=tls_holder,
+    )
     pool = transport._pool  # type: ignore[attr-defined]
     pool._network_backend = backend  # type: ignore[attr-defined]
-    return transport
+    return transport, backend
 
 
 async def fetch_url_raw(
@@ -907,8 +976,11 @@ async def fetch_url_raw(
     dns_override: dict[str, str] | None = None,
     verify_tls: bool = True,
     allow_private_network: bool | None = None,
+    include_tls: bool = False,
+    tls_only: bool = False,
 ) -> dict[str, Any]:
     """Perform a single stateless HTTP request and return a structured result."""
+    tls_holder: dict[str, Any] = {}
     try:
         parsed_url = _validate_url(url)
         http_method = _validate_method(method)
@@ -921,13 +993,70 @@ async def fetch_url_raw(
             raise InvalidParameterError("follow_redirect must be a boolean")
         if not isinstance(verify_tls, bool):
             raise InvalidParameterError("verify_tls must be a boolean")
+        if not isinstance(include_tls, bool):
+            raise InvalidParameterError("include_tls must be a boolean")
+        if not isinstance(tls_only, bool):
+            raise InvalidParameterError("tls_only must be a boolean")
+        if tls_only and not include_tls:
+            raise InvalidParameterError("tls_only requires include_tls=true")
+        if tls_only and parsed_url.scheme != "https":
+            raise InvalidParameterError("tls_only is only valid for https URLs")
+
+        # Handshake-only path: no HTTP request is sent.
+        if tls_only:
+            allow = (
+                runtime_config.get_allow_private_network()
+                if allow_private_network is None
+                else bool(allow_private_network)
+            )
+            host = parsed_url.host
+            if not host:
+                raise InvalidUrlError("URL must include a host")
+            port = parsed_url.port or 443
+            started = time.perf_counter()
+            try:
+                tls_info = await probe_tls(
+                    host=host,
+                    port=port,
+                    server_hostname=host,
+                    verify_tls=verify_tls,
+                    dns_override=overrides,
+                    allow_private_network=allow,
+                    timeout=timeout_s,
+                )
+            except Exception as exc:  # noqa: BLE001
+                mapped = _map_exception(exc)
+                # Best-effort: probe_tls failures usually have no partial TLS object.
+                raise mapped from exc
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            return {
+                "success": True,
+                "status": None,
+                "reason": None,
+                "http_version": None,
+                "headers": None,
+                "body": None,
+                "body_json": None,
+                "body_base64": None,
+                "content_type": None,
+                "encoding": None,
+                "elapsed_ms": elapsed_ms,
+                "redirected": False,
+                "final_url": str(parsed_url),
+                "truncated": False,
+                "received_bytes": 0,
+                "content_length": None,
+                "tls": tls_info,
+            }
 
         content, req_headers = _normalize_request_body(body, req_headers)
 
-        transport = _build_transport(
+        transport, _backend = _build_transport(
             verify_tls=verify_tls,
             dns_override=overrides,
             allow_private_network=allow_private_network,
+            capture_tls=include_tls and parsed_url.scheme == "https",
+            tls_holder=tls_holder,
         )
         timeout_cfg = httpx.Timeout(timeout_s)
 
@@ -1045,7 +1174,7 @@ async def fetch_url_raw(
             if not http_version.startswith("HTTP"):
                 http_version = f"HTTP/{http_version}"
 
-            return {
+            result: dict[str, Any] = {
                 "success": True,
                 "status": response.status_code,
                 "reason": response.reason_phrase or "",
@@ -1063,8 +1192,33 @@ async def fetch_url_raw(
                 "received_bytes": received,
                 "content_length": content_length,
             }
+            if include_tls:
+                # Present for HTTPS after a successful handshake; null for HTTP.
+                result["tls"] = tls_holder.get("tls")
+            return result
 
     except FetchError as err:
+        err = await _maybe_attach_tls(
+            err,
+            url=url,
+            include_tls=include_tls,
+            tls_holder=tls_holder,
+            verify_tls=verify_tls,
+            dns_override=dns_override,
+            allow_private_network=allow_private_network,
+            timeout=timeout,
+        )
         return err.to_dict()
     except Exception as exc:  # noqa: BLE001 - never leak traceback to MCP client
-        return _map_exception(exc).to_dict()
+        mapped = _map_exception(exc)
+        mapped = await _maybe_attach_tls(
+            mapped,
+            url=url,
+            include_tls=include_tls,
+            tls_holder=tls_holder,
+            verify_tls=verify_tls,
+            dns_override=dns_override,
+            allow_private_network=allow_private_network,
+            timeout=timeout,
+        )
+        return mapped.to_dict()

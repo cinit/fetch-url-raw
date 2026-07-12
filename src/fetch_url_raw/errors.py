@@ -10,20 +10,36 @@ class FetchError(Exception):
 
     error_type: str = "ERROR"
 
-    def __init__(self, message: str, *, error_type: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str | None = None,
+        tls: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         if error_type is not None:
             self.error_type = error_type
         self.message = message
+        self.tls = tls
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "success": False,
             "error": {
                 "type": self.error_type,
                 "message": self.message,
             },
         }
+        if self.tls is not None:
+            payload["tls"] = self.tls
+        return payload
+
+    def with_tls(self, tls: dict[str, Any] | None) -> FetchError:
+        """Return a copy of this error with TLS metadata attached."""
+        if tls is None:
+            return self
+        return FetchError(self.message, error_type=self.error_type, tls=tls)
 
 
 class InvalidUrlError(FetchError):
@@ -60,4 +76,3 @@ class ResponseTooLargeError(FetchError):
 
 class DestinationBlockedError(FetchError):
     error_type = "DESTINATION_BLOCKED"
-

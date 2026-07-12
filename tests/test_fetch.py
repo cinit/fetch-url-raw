@@ -578,3 +578,40 @@ async def test_text_without_content_length_full_size_from_prefetch(monkeypatch):
     assert result["body"] is not None
     assert result["content_length"] == len(payload)
     assert result["received_bytes"] == 100
+
+
+
+@pytest.mark.asyncio
+async def test_tls_only_requires_include_tls():
+    result = await fetch_url_raw(url="https://example.com/", tls_only=True)
+    assert result["success"] is False
+    assert result["error"]["type"] == "INVALID_PARAMETER"
+
+
+@pytest.mark.asyncio
+async def test_tls_only_rejects_http():
+    result = await fetch_url_raw(url="http://example.com/", include_tls=True, tls_only=True)
+    assert result["success"] is False
+    assert result["error"]["type"] == "INVALID_PARAMETER"
+
+
+def test_error_to_dict_includes_tls():
+    from fetch_url_raw.errors import TlsError
+    err = TlsError("boom", tls={"version": "TLSv1.3"})
+    d = err.to_dict()
+    assert d["success"] is False
+    assert d["error"]["type"] == "TLS_ERROR"
+    assert d["tls"]["version"] == "TLSv1.3"
+
+
+def test_build_tls_info_from_synthetic_ssl(monkeypatch):
+    """Unit-level cert formatting without network."""
+    import ssl
+    from fetch_url_raw.tlsinfo import build_tls_info, _cert_from_der, _fingerprint_sha256
+
+    # Use a tiny invalid DER only for fingerprint helper shape
+    der = b"\x30\x82\x01\x00" + b"\x00" * 10
+    info = _cert_from_der(der, None)
+    assert info["pem"].startswith("-----BEGIN CERTIFICATE-----")
+    assert info["fingerprint_sha256"] == _fingerprint_sha256(der)
+    assert info["subject"] == {}

@@ -30,7 +30,7 @@ mcp = FastMCP(
     description=(
         "Perform a single raw HTTP request and return status, headers, and body. "
         "Supports custom method/headers/body (raw string or JSON value), timeouts, redirect following, "
-        "max response size, TLS verify toggle, and DNS overrides (like curl --resolve). "
+        "max response size, TLS verify toggle, optional TLS cert inspection (include_tls/tls_only), and DNS overrides (like curl --resolve). "
         "Text-like bodies are returned as UTF-8 text; binary bodies are base64-encoded. "
         "On failure returns {success:false, error:{type,message}} instead of throwing."
     ),
@@ -46,6 +46,8 @@ async def fetch_url_raw(
     max_response_bytes: int = 1_048_576,
     dns_override: dict[str, str] | None = None,
     verify_tls: bool = True,
+    include_tls: bool = False,
+    tls_only: bool = False,
 ) -> dict[str, Any]:
     """Fetch a URL with raw HTTP semantics.
 
@@ -61,9 +63,14 @@ async def fetch_url_raw(
         max_response_bytes: Stop reading body after this many bytes (default 1 MiB).
         dns_override: Optional map of hostname -> IP for connection only (SNI/Host preserved).
         verify_tls: Verify TLS certificates (default true).
+        include_tls: Include negotiated TLS metadata and peer certificate(s) in the result
+            (HTTPS only). Default false.
+        tls_only: Perform TCP+TLS handshake only and return cert info; no HTTP request.
+            Requires include_tls=true and an https URL.
 
     Returns:
-        Structured success payload or {success:false, error:{type,message}}.
+        Structured success payload or {success:false, error:{type,message}}
+        (TLS_ERROR may also include a top-level tls object with partial cert data).
     """
     return await do_fetch(
         url=url,
@@ -75,6 +82,8 @@ async def fetch_url_raw(
         max_response_bytes=max_response_bytes,
         dns_override=dns_override,
         verify_tls=verify_tls,
+        include_tls=include_tls,
+        tls_only=tls_only,
     )
 
 

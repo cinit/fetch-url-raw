@@ -12,6 +12,7 @@ import httpcore
 from httpcore._backends.anyio import AnyIOBackend
 
 from fetch_url_raw.network_policy import blocked_reason, is_destination_blocked
+from fetch_url_raw.tlsinfo import TlsCapturingStream
 
 
 def _exception_chain(exc: BaseException) -> list[BaseException]:
@@ -62,13 +63,22 @@ class GuardedNetworkBackend(AnyIOBackend):
         overrides: Mapping[str, str] | None = None,
         *,
         allow_private_network: bool = False,
+        capture_tls: bool = False,
+        tls_holder: dict[str, Any] | None = None,
     ) -> None:
         super().__init__()
         self._allow_private_network = allow_private_network
+        self._capture_tls = bool(capture_tls)
+        self._tls_holder: dict[str, Any] = tls_holder if tls_holder is not None else {}
         self._overrides: dict[str, str] = {}
         if overrides:
             for host, ip in overrides.items():
                 self._overrides[host.lower().rstrip(".")] = str(ip).strip()
+
+    @property
+    def tls_info(self) -> dict[str, Any] | None:
+        value = self._tls_holder.get("tls")
+        return value if isinstance(value, dict) else None
 
     def resolve_override(self, host: str) -> str | None:
         key = host.lower().rstrip(".")
@@ -150,13 +160,21 @@ class GuardedNetworkBackend(AnyIOBackend):
         for ip in allowed_ips:
             try:
                 # Pin connection to the checked IP. SNI/Host stay on original hostname.
-                return await super().connect_tcp(
+                stream = await super().connect_tcp(
                     host=ip,
                     port=port,
                     timeout=timeout,
                     local_address=local_address,
                     socket_options=socket_options,
                 )
+                if self._capture_tls:
+                    return TlsCapturingStream(
+                        stream,
+                        self._tls_holder,
+                        peer_ip=ip,
+                        peer_port=port,
+                    )
+                return stream
             except httpcore.ConnectError as exc:
                 errors.append(f"{ip}: {_format_connect_failure(exc)}")
                 last_exc = exc
